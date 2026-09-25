@@ -17,26 +17,29 @@ description: 用 xqapi.com 中转站生图/改图。文生图、图生图/局部
 ## 快速上手
 
 ```bash
+# 0. 先查模型名（别照抄文档占位符）
+python scripts/xqapi_image.py models
+
 # 文生图
-python scripts/xqapi_image.py gen "一座未来城市，黄昏，体积光" -m <MODEL> -r 2k -o out/city.png
+python scripts/xqapi_image.py gen "一座未来城市，黄昏，体积光" -m gpt-image-2 -r 2k -o out/city.png
 
 # 长任务 / 4k → 一律加 --async，绕开 600s 同步上限
-python scripts/xqapi_image.py gen "赛博朋克海报" -m <MODEL> -r 4k --async --outdir out/
+python scripts/xqapi_image.py gen "赛博朋克海报" -m gpt-image-2 -r 4k --async --outdir out/
 
 # 图生图（多张参考图，multipart 路）
-python scripts/xqapi_image.py edit "把背景换成雪山" -m <MODEL> -i cat.png -i style.png -r 2k
+python scripts/xqapi_image.py edit "把背景换成雪山" -m gpt-image-2 -i cat.png -i style.png -r 2k
 
 # 局部重绘
-python scripts/xqapi_image.py edit "把猫换成狗" -m <MODEL> -i cat.png --mask mask.png
+python scripts/xqapi_image.py edit "把猫换成狗" -m gpt-image-2 -i cat.png --mask mask.png
 
 # 参考图是直链（JSON 路）
-python scripts/xqapi_image.py edit "换背景" -m <MODEL> --image-url https://example.com/cat.png
+python scripts/xqapi_image.py edit "换背景" -m gpt-image-2 --image-url https://example.com/cat.png
 
-# b64 内联，不走托管直链
-python scripts/xqapi_image.py gen "logo" -m <MODEL> --b64-json -o out/logo.png
+# b64 内联，不走托管直链（下载慢时可试）
+python scripts/xqapi_image.py gen "logo" -m gpt-image-2 --b64-json -o out/logo.png
 
 # 探测某模型支持哪些 resolution（会花钱）
-python scripts/xqapi_image.py probe -m <MODEL>
+python scripts/xqapi_image.py probe -m gpt-image-2
 ```
 
 ## 配置 API Key
@@ -52,16 +55,64 @@ python scripts/xqapi_image.py probe -m <MODEL>
 [Environment]::SetEnvironmentVariable("XQAPI_API_KEY","sk-xxx","User")
 ```
 
-## 关键约定（踩坑点）
+## 关键约定（实测踩坑点）
+
+> 以下三处是**实测踩出来的**，不是文档写的。照文档写会踩。
+
+### 1. User-Agent 是硬性要求
+
+不带 `User-Agent` 头 → **HTTP 403 Cloudflare Error 1010: Access denied**。
+
+| UA | 结果 |
+|---|---|
+| 不带 UA 头 | ❌ 403 / Error 1010 |
+| 脚本名 UA（`MyAgent/1.0`） | ✅ 200 |
+| 浏览器 UA | ✅ 200 |
+| `Python-urllib/3.x` 默认 | ❌ SSL 连接被重置 |
+
+**不需要伪装浏览器**，但必须带一个像样的 UA。脚本已默认带浏览器 UA，
+一般不用管；要覆盖用 `--user-agent` 或环境变量 `XQAPI_USER_AGENT`。
+
+### 2. 模型名别照抄文档
+
+文档示例里的 `your-image-model` / `gpt-image-1` 都是占位符，传 `gpt-image-1`
+会返回 `400 模型不存在或未启用`。**先查再调**：
+
+```bash
+python scripts/xqapi_image.py models
+```
+
+实测该站当前图像模型为 **`gpt-image-2`**（`/v1/models` 共 24 个模型，
+图像模型仅此一个）。
+
+### 3. 延迟构成 —— 下载可能比生成还慢
+
+实测 `gpt-image-2` 出 1 张 1k 图：
+
+```
+POST 提交 → 200 响应      109.6s   ← 纯生成
+直链下载 2.48MB           69.9s    ← 占比 39%，很反常
+──────────────────────────────────
+端到端                    179.5s
+```
+
+1k 就要 110s，**4k 基本必然顶到 600s 上限**。所以：
+
+- 长任务 / 4k / 多张 → **一律加 `--async`**
+- 嫌下载慢 → 试 `--b64-json` 走内联 base64，可能更快
+- 脚本已把下载单独计时并打印，方便你判断瓶颈
+
+### 其余约定
 
 | 项 | 值 | 说明 |
 |---|---|---|
 | 同步等待上限 | **600s** | 与官方 SDK 默认超时一致，超时站点返回 **504** |
 | 504 退出码 | **4** | 脚本在 stderr 给 `--async` 建议 |
+| 403 退出码 | **3** | UA 缺失；脚本会直接给出处置建议 |
 | 异步开关 | `--async` | 请求带 `async:true`，拿 task_id 自己轮询 |
-| resolution | `1k`/`2k`/`4k` | **大小写不敏感**，脚本自动小写归一 |
+| resolution | `1k`/`2k`/`4k` | **大小写不敏感**，脚本自动小写归一；未实测各档耗时 |
 | 参考图上限 | **16** | 超了直接报错，不发请求 |
-| quality / size / output_format | 视模型而定 | **不要写死**，取值以模型详情页为准，用 `--extra` 透传 |
+| quality / size / output_format | 视模型而定 | **不要写死**，用 `--extra` 透传 |
 | 图片落地 | 默认直链 | 加 `--b64-json` 改内联 base64 |
 
 ### 参考图两种给法互斥
@@ -86,7 +137,7 @@ python scripts/xqapi_image.py probe -m <MODEL>
 通用（`gen` / `edit` 都有）：
 
 ```
--m, --model            必填，模型名
+-m, --model            必填，模型名（先跑 models 子命令查）
 -r, --resolution       1k | 2k | 4k（大小写不敏感）
 -q, --quality          quality，取值看模型详情页
 -s, --size             官方像素串，如 1024x1024
@@ -97,6 +148,7 @@ python scripts/xqapi_image.py probe -m <MODEL>
 --timeout              同步等待秒数，默认 600
 --poll-interval        轮询间隔，默认 3s
 --poll-max-wait        轮询总上限，默认 3600s
+--user-agent, --ua     覆盖 UA（默认已带浏览器 UA；缺 UA 会被 403）
 --extra K=V            透传任意字段，可重复，值自动识别类型
 --base                 API 根地址，默认 https://xqapi.com/v1
 -o, --out              单图完整输出路径
@@ -116,7 +168,7 @@ from openai import OpenAI
 client = OpenAI(api_key="sk-xxx", base_url="https://xqapi.com/v1", timeout=600)
 
 r = client.images.generate(
-    model="<MODEL>",
+    model="gpt-image-2",
     prompt="一座未来城市",
     extra_body={"resolution": "2k"},   # 本站扩展字段走 extra_body
 )
@@ -124,6 +176,9 @@ print(r.data[0].url)
 ```
 
 注意：`resolution`、`async` 是本站扩展，官方 SDK 没有对应形参，**必须走 `extra_body`**。
+
+另外：站点要求带 User-Agent。官方 SDK 会自带一个（`OpenAI/Python x.y.z`），
+实测这类普通 UA 能过；但如果你在别的地方手工发请求，**漏了 UA 就是 403**。
 
 ## 自测
 
@@ -145,8 +200,11 @@ examples/*.md              提示词与用法示例
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
+| **403 / Error 1010** | **UA 缺失或不被接受** | 去掉 `--user-agent` 用默认，或给一个像样的 UA |
+| `模型不存在或未启用` (400) | 模型名照抄了文档占位符 | 先跑 `models` 子命令查真名 |
 | 退出码 4 | 同步超 600s，站点 504 | 加 `--async` |
-| 退出码 3 | API 报错 | 看 stderr 里的响应体，多半是参数不被该模型支持 |
+| 退出码 3 | API 报错 | 看 stderr 里的响应体 |
 | `quality` 传了报 400 | 该模型不支持这个取值 | 去掉，或 `probe` 摸一遍 |
 | 参考图 > 16 | 站点硬限制 | 拆成多次调用 |
-| 中文乱码 | 控制台码页非 UTF-8 | 设 `PYTHONIOENCODING=utf-8`，或直接看落地的图片文件 |
+| 出图快、等下载慢 | 直链下载带宽受限（实测 2.5MB 走 70s） | 试 `--b64-json` |
+| 中文乱码 | 控制台码页非 UTF-8 | 设 `PYTHONIOENCODING=utf-8` |

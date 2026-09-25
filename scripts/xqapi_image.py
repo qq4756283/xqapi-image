@@ -12,7 +12,7 @@ b64_json 内联落地。
 用法速查
 --------
 文生图:
-    python xqapi_image.py gen "一座未来城市" -m gpt-image-1 -r 2k -o out/city.png
+    python xqapi_image.py gen "一座未来城市" -m gpt-image-2 -r 2k -o out/city.png
     python xqapi_image.py gen "赛博朋克海报" -r 4k --async --outdir out/
 图生图:
     python xqapi_image.py edit "把背景换成雪山" -i cat.png -i style.png -r 2k
@@ -22,7 +22,7 @@ URL 参考图(JSON 路):
 目录内 URL 批量:
     python xqapi_image.py edit "统一加雪景" --image-urls a.png.url b.png.url
 参数探测:
-    python xqapi_image.py probe -m gpt-image-1
+    python xqapi_image.py probe -m gpt-image-2
 任务查询:
     python xqapi_image.py task <task_id>
 """
@@ -59,6 +59,24 @@ POLL_MAX_WAIT = 3600.0
 MAX_REF_IMAGES = 16
 
 RESOLUTIONS = ("1k", "2k", "4k")
+
+# ---------------------------------------------------------------------------
+# UA —— 实测必需，不是可选项
+#
+# 不带 User-Agent 头会被站点前置的 Cloudflare 拦掉：
+#   HTTP 403  Error 1010: Access denied
+# 带任意"像样"的 UA（脚本名或浏览器 UA）都能通过，不需要伪装成浏览器。
+# 但 Python-urllib 默认 UA 会触发 SSL 层异常，所以必须显式设置。
+# 默认给浏览器 UA 最稳。
+# ---------------------------------------------------------------------------
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# 图片下载单独超时。实测 2.5MB 的 1024x1024 PNG 走了近 70s，
+# 默认 120s 对 4k 大图偏紧。
+DOWNLOAD_TIMEOUT = 300.0
 
 
 class XqapiError(RuntimeError):
@@ -160,6 +178,16 @@ def _encode_multipart(
 # ----------------------------------------------------------------------------
 
 
+def resolve_ua(cli_value: str | None = None) -> str:
+    """UA 解析。优先级：命令行 > 环境变量 > 内置浏览器 UA。"""
+    if cli_value:
+        return cli_value.strip()
+    v = os.environ.get("XQAPI_USER_AGENT")
+    if v:
+        return v.strip()
+    return DEFAULT_UA
+
+
 def _request(
     url: str,
     api_key: str,
@@ -167,11 +195,13 @@ def _request(
     json_body: dict | None = None,
     multipart: tuple[bytes, str] | None = None,
     timeout: float = SYNC_TIMEOUT,
+    ua: str | None = None,
 ) -> tuple[int, str]:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
-        "User-Agent": "xqapi-image/1.0",
+        # 缺了这个头会被 Cloudflare 以 1010 拒绝
+        "User-Agent": ua or DEFAULT_UA,
     }
 
     data: bytes | None = None
@@ -201,12 +231,61 @@ def _request(
         return 0, json.dumps({"error": {"message": f"网络错误: {reason}"}})
 
 
-def _download(url: str, dest: Path, timeout: float = 120.0) -> Path:
+def _download(url: str, dest: Path, timeout: float = DOWNLOAD_TIMEOUT,
+              ua: str | None = None, retries: int = 3) -> Path:
+    """
+    下载直链到本地。带重试 + 断点续传。
+
+    实测该站直链在传输中途会被掐断（http.client.IncompleteRead），
+    单次下载不可靠，必须重试；已落盘的部分用 HTTP Range 续传，
+    避免每次从头重拉 2.5MB。
+    """
     ctx = ssl.create_default_context()
-    req = urllib.request.Request(url, headers={"User-Agent": "xqapi-image/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-        dest.write_bytes(resp.read())
-    return dest
+    last_err: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        have = dest.stat().st_size if dest.exists() else 0
+        headers = {"User-Agent": ua or DEFAULT_UA}
+        if have:
+            headers["Range"] = f"bytes={have}-"
+
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                code = resp.status
+                total = resp.headers.get("Content-Length")
+                total = int(total) if total and total.isdigit() else None
+
+                # 服务端不支持 Range 会回 200 全量，此时必须从头写
+                mode = "ab" if (have and code == 206) else "wb"
+                if mode == "wb":
+                    have = 0
+
+                with open(dest, mode) as f:
+                    while True:
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+
+            got = dest.stat().st_size
+            if total is not None and have + total != got:
+                raise IOError(f"长度不符: 期望 {have + total}, 实际 {got}")
+            return dest
+
+        except Exception as e:
+            last_err = e
+            got = dest.stat().st_size if dest.exists() else 0
+            print(
+                f"[xqapi-image] 下载失败 ({attempt}/{retries}): "
+                f"{type(e).__name__}  已落盘 {got} 字节，续传中…",
+                file=sys.stderr,
+            )
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+
+    die(f"下载重试 {retries} 次仍失败: {last_err}")
+    raise SystemExit(2)  # unreachable
 
 
 # ----------------------------------------------------------------------------
@@ -234,6 +313,8 @@ def save_results(
     *,
     prefix: str = "img",
     out: Path | None = None,
+    ua: str | None = None,
+    quiet: bool = False,
 ) -> list[Path]:
     """
     把响应里的 data[] 全部落地。返回写出文件列表。
@@ -260,7 +341,15 @@ def save_results(
         if item.get("b64_json"):
             dest.write_bytes(base64.b64decode(item["b64_json"]))
         elif item.get("url"):
-            _download(item["url"], dest)
+            # 直链下载。实测这一步可能很慢（2.5MB 走了近 70s），单独计时。
+            t0 = time.monotonic()
+            _download(item["url"], dest, ua=ua)
+            if not quiet:
+                print(
+                    f"  下载 {time.monotonic() - t0:.1f}s  "
+                    f"{dest.stat().st_size / 1024 / 1024:.2f} MB",
+                    file=sys.stderr,
+                )
         else:
             print(
                 f"[xqapi-image] 警告: data[{idx}] 既无 url 也无 b64_json，跳过",
@@ -316,6 +405,7 @@ def poll_task(
     interval: float = POLL_INTERVAL,
     max_wait: float = POLL_MAX_WAIT,
     quiet: bool = False,
+    ua: str | None = None,
 ) -> dict:
     """轮询异步任务直到出图 / 失败 / 超时。"""
     deadline = time.monotonic() + max_wait
@@ -328,13 +418,13 @@ def poll_task(
 
         url = f"{base}/images/tasks/{task_id}"
         t0 = time.monotonic()
-        status, body = _request(url, api_key, json_body=None, timeout=60.0)
+        status, body = _request(url, api_key, json_body=None, timeout=60.0, ua=ua)
         elapsed = time.monotonic() - t0
 
         # GET 语义：这里用 POST 空体查任务，若站点要 GET 会 405，
         # 回退到 GET 形式。
         if status in (404, 405):
-            status, body = _get(url, api_key, timeout=60.0)
+            status, body = _get(url, api_key, timeout=60.0, ua=ua)
 
         try:
             payload = json.loads(body)
@@ -372,13 +462,14 @@ def poll_task(
         time.sleep(interval)
 
 
-def _get(url: str, api_key: str, timeout: float = 60.0) -> tuple[int, str]:
+def _get(url: str, api_key: str, timeout: float = 60.0,
+         ua: str | None = None) -> tuple[int, str]:
     req = urllib.request.Request(
         url,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
-            "User-Agent": "xqapi-image/1.0",
+            "User-Agent": ua or DEFAULT_UA,
         },
         method="GET",
     )
@@ -400,6 +491,7 @@ def call_image_api(
     multipart: tuple[bytes, str] | None = None,
     use_async: bool = False,
     timeout: float = SYNC_TIMEOUT,
+    ua: str | None = None,
 ) -> dict:
     """
     统一入口。返回最终含 data[] 的 payload。
@@ -418,7 +510,7 @@ def call_image_api(
     print(f"[xqapi-image] POST {url}", file=sys.stderr)
     t0 = time.monotonic()
     status, text = _request(
-        url, api_key, json_body=body, multipart=multipart, timeout=timeout
+        url, api_key, json_body=body, multipart=multipart, timeout=timeout, ua=ua
     )
     elapsed = time.monotonic() - t0
     print(f"[xqapi-image] <- HTTP {status}  ({elapsed:.1f}s)", file=sys.stderr)
@@ -436,13 +528,23 @@ def call_image_api(
 
     if status >= 400:
         msg = json.dumps(payload, ensure_ascii=False)
+        # Cloudflare 1010：UA 缺失或不被接受。这是最容易被误判成"Key 无效"的坑。
+        if status == 403 or "1010" in msg:
+            die(
+                "被 Cloudflare 拒绝 (HTTP 403 / Error 1010)。\n"
+                "  原因：User-Agent 缺失或不被接受——站点把 UA 当硬性要求。\n"
+                "  处置：本脚本默认已带浏览器 UA；若你覆盖过，去掉 --user-agent，\n"
+                "        或显式给一个像样的值：--user-agent 'Mozilla/5.0 ...'",
+                3,
+            )
         raise XqapiError(status, msg, url)
 
     # 拿到任务 ID -> 轮询
     if _looks_like_task(payload):
         task_id = _extract_task_id(payload)
         print(f"[xqapi-image] 异步任务: {task_id}", file=sys.stderr)
-        return poll_task(base, api_key, task_id)
+        return poll_task(base, api_key, task_id,
+                         interval=POLL_INTERVAL, max_wait=POLL_MAX_WAIT, ua=ua)
 
     return payload
 
@@ -473,6 +575,9 @@ def _common_opts(p: argparse.ArgumentParser) -> None:
     p.add_argument("--api-key", help="覆盖 API Key")
     p.add_argument("--base", default=os.environ.get("XQAPI_BASE_URL", DEFAULT_BASE),
                    help=f"API 根地址，默认 {DEFAULT_BASE}")
+    p.add_argument("--user-agent", "--ua", dest="user_agent",
+                   help="覆盖 User-Agent。**缺 UA 会被 Cloudflare 403 拒绝**，"
+                        "默认已带浏览器 UA，一般不用改")
     p.add_argument("-o", "--out", help="单图时指定完整输出路径")
     p.add_argument("--outdir", default="out", help="多图输出目录，默认 out/")
     p.add_argument("--json", dest="dump_json", action="store_true",
@@ -497,6 +602,7 @@ def _fill_resolution(body: dict, res: str | None) -> None:
 
 def cmd_gen(args: argparse.Namespace) -> int:
     api_key = load_api_key(args.api_key)
+    ua = resolve_ua(args.user_agent)
 
     body: dict = {"model": args.model, "prompt": args.prompt}
     _fill_resolution(body, args.resolution)
@@ -514,7 +620,7 @@ def cmd_gen(args: argparse.Namespace) -> int:
 
     payload = call_image_api(
         args.base, api_key, "images/generations",
-        json_body=body, use_async=args.use_async, timeout=args.timeout,
+        json_body=body, use_async=args.use_async, timeout=args.timeout, ua=ua,
     )
 
     if args.dump_json:
@@ -522,7 +628,7 @@ def cmd_gen(args: argparse.Namespace) -> int:
 
     files = save_results(
         payload, Path(args.outdir),
-        prefix="gen", out=Path(args.out) if args.out else None,
+        prefix="gen", out=Path(args.out) if args.out else None, ua=ua,
     )
     print(f"\n[xqapi-image] 完成，{len(files)} 张图")
     return 0
@@ -530,6 +636,7 @@ def cmd_gen(args: argparse.Namespace) -> int:
 
 def cmd_edit(args: argparse.Namespace) -> int:
     api_key = load_api_key(args.api_key)
+    ua = resolve_ua(args.user_agent)
 
     imgs: list[Path] = [Path(p) for p in (args.image or [])]
     if len(imgs) > MAX_REF_IMAGES:
@@ -569,7 +676,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(f"[xqapi-image] JSON 路，{len(items)} 张 URL 参考图", file=sys.stderr)
         payload = call_image_api(
             args.base, api_key, "images/edits",
-            json_body=body, use_async=args.use_async, timeout=args.timeout,
+            json_body=body, use_async=args.use_async, timeout=args.timeout, ua=ua,
         )
     else:
         # multipart 路：重复 image 字段
@@ -587,7 +694,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         )
         payload = call_image_api(
             args.base, api_key, "images/edits",
-            multipart=mp, use_async=args.use_async, timeout=args.timeout,
+            multipart=mp, use_async=args.use_async, timeout=args.timeout, ua=ua,
         )
 
     if args.dump_json:
@@ -595,7 +702,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     out_files = save_results(
         payload, Path(args.outdir),
-        prefix="edit", out=Path(args.out) if args.out else None,
+        prefix="edit", out=Path(args.out) if args.out else None, ua=ua,
     )
     print(f"\n[xqapi-image] 完成，{len(out_files)} 张图")
     return 0
@@ -603,15 +710,16 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
 def cmd_task(args: argparse.Namespace) -> int:
     api_key = load_api_key(args.api_key)
+    ua = resolve_ua(getattr(args, "user_agent", None))
     payload = poll_task(
         args.base, api_key, args.task_id,
-        interval=args.poll_interval, max_wait=args.poll_max_wait,
+        interval=args.poll_interval, max_wait=args.poll_max_wait, ua=ua,
     )
     if args.dump_json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     if payload.get("data"):
         save_results(payload, Path(args.outdir), prefix="task",
-                     out=Path(args.out) if args.out else None)
+                     out=Path(args.out) if args.out else None, ua=ua)
     else:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
@@ -623,6 +731,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     会真实产生费用，仅在你明确要摸底时用。
     """
     api_key = load_api_key(args.api_key)
+    ua = resolve_ua(getattr(args, "user_agent", None))
     results: dict[str, str] = {}
 
     for res in RESOLUTIONS:
@@ -631,7 +740,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         try:
             payload = call_image_api(
                 args.base, api_key, "images/generations",
-                json_body=body, use_async=True, timeout=args.timeout,
+                json_body=body, use_async=True, timeout=args.timeout, ua=ua,
             )
             ok = bool(payload.get("data"))
             results[res] = "OK" if ok else "OK(无 data)"
@@ -641,6 +750,52 @@ def cmd_probe(args: argparse.Namespace) -> int:
     print("\n[xqapi-image] resolution 探测结果:")
     for k, v in results.items():
         print(f"  {k}: {v}")
+    return 0
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    """
+    列出可用模型。文档示例里的模型名多为占位符，照抄会吃
+    {'message': '模型不存在或未启用。'}，所以先查再调。
+    """
+    api_key = load_api_key(args.api_key)
+    ua = resolve_ua(getattr(args, "user_agent", None))
+    url = f"{args.base}/models"
+    status, text = _get(url, api_key, timeout=60.0, ua=ua)
+
+    if status >= 400:
+        die(f"查询模型列表失败 HTTP {status}: {text[:300]}", 3)
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        die(f"模型列表返回非 JSON: {text[:300]}", 3)
+
+    items = payload.get("data") or []
+    if not items:
+        die("模型列表为空")
+
+    # 关键词粗筛图像模型
+    HINTS = ("image", "img", "dall", "flux", "sd", "seedream", "qwen-image",
+             "nano", "banana", "vision")
+
+    print(f"共 {len(items)} 个模型:\n")
+    image_like = []
+    for m in items:
+        mid = m.get("id", "?") if isinstance(m, dict) else str(m)
+        low = mid.lower()
+        hit = any(h in low for h in HINTS)
+        print(f"  {'*' if hit else ' '} {mid}")
+        if hit:
+            image_like.append(mid)
+
+    if image_like:
+        print(f"\n疑似图像/视觉模型 ({len(image_like)}):")
+        for m in image_like:
+            print(f"  {m}")
+
+    if args.json:
+        print("\n" + json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -681,6 +836,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--poll-max-wait", type=float, default=POLL_MAX_WAIT)
     t.add_argument("--api-key")
     t.add_argument("--base", default=os.environ.get("XQAPI_BASE_URL", DEFAULT_BASE))
+    t.add_argument("--user-agent", "--ua", dest="user_agent")
     t.add_argument("-o", "--out")
     t.add_argument("--outdir", default="out")
     t.add_argument("--json", dest="dump_json", action="store_true")
@@ -692,7 +848,15 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--timeout", type=float, default=SYNC_TIMEOUT)
     pr.add_argument("--api-key")
     pr.add_argument("--base", default=os.environ.get("XQAPI_BASE_URL", DEFAULT_BASE))
+    pr.add_argument("--user-agent", "--ua", dest="user_agent")
     pr.set_defaults(func=cmd_probe)
+
+    md = sub.add_parser("models", help="列出可用模型（先查再调，别照抄文档占位符）")
+    md.add_argument("--api-key")
+    md.add_argument("--base", default=os.environ.get("XQAPI_BASE_URL", DEFAULT_BASE))
+    md.add_argument("--user-agent", "--ua", dest="user_agent")
+    md.add_argument("--json", action="store_true")
+    md.set_defaults(func=cmd_models)
 
     return p
 

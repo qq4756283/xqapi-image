@@ -86,6 +86,20 @@ body3 = {}
 x._fill_resolution(body3, None)
 check("resolution 缺省不下发", "resolution" not in body3)
 
+print("== UA 处理 ==")
+# 实测结论：缺 UA 会被 Cloudflare 403(1010) 拦掉，所以 UA 必须显式带上。
+check("默认 UA 非空", bool(x.DEFAULT_UA) and len(x.DEFAULT_UA) > 10)
+check("默认 UA 是浏览器 UA", "Mozilla" in x.DEFAULT_UA)
+import os as _os
+_os.environ.pop("XQAPI_USER_AGENT", None)
+check("resolve_ua 回退默认", x.resolve_ua(None) == x.DEFAULT_UA)
+check("resolve_ua 尊重显式值", x.resolve_ua("MyAgent/2.0") == "MyAgent/2.0")
+_os.environ["XQAPI_USER_AGENT"] = "EnvAgent/1.0"
+check("resolve_ua 读环境变量", x.resolve_ua(None) == "EnvAgent/1.0")
+check("显式值优先于环境变量", x.resolve_ua("Cli/1.0") == "Cli/1.0")
+_os.environ.pop("XQAPI_USER_AGENT", None)
+check("DOWNLOAD_TIMEOUT 够大", x.DOWNLOAD_TIMEOUT >= 300.0)
+
 print("== 参考图上限 ==")
 check("MAX_REF_IMAGES == 16", x.MAX_REF_IMAGES == 16)
 check("SYNC_TIMEOUT == 600", x.SYNC_TIMEOUT == 600.0)

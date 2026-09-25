@@ -21,7 +21,10 @@ PNG = (
     b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
 )
 
-STATE = {"polls": 0}
+STATE = {"polls": 0, "flaky_hits": 0}
+
+# 一个较大的伪图，用于触发分块下载与续传
+BIG_PNG = PNG + b"\x00" * (600 * 1024)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -48,6 +51,14 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw)
             if body.get("model") == "mock-slow":
                 self._json(504, {"error": {"message": "gateway timeout"}})
+                return
+            if body.get("model") == "mock-flaky":
+                # 指向一个第一次会掐断、第二次可续传的地址
+                self._json(200, {
+                    "created": 1,
+                    "data": [{"url": f"http://127.0.0.1:{PORT}/flaky/big.png"}],
+                    "usage": {"total_tokens": 5},
+                })
                 return
             if body.get("async") is True:
                 STATE["polls"] = 0
@@ -88,14 +99,60 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json(404, {"error": {"message": "not found"}})
 
-    def do_GET(self):
-        if self.path.startswith("/img/"):
+    def _send_blob(self, blob, ranged):
+        """发送图片；ranged=True 时支持 Range 续传。"""
+        rng = self.headers.get("Range")
+        start = 0
+        if ranged and rng and rng.startswith("bytes="):
+            try:
+                start = int(rng.split("=")[1].split("-")[0])
+            except Exception:
+                start = 0
+            if start > len(blob):
+                start = len(blob)
+            self.send_response(206)
+            self.send_header("Content-Range",
+                             f"bytes {start}-{len(blob)-1}/{len(blob)}")
+        else:
             self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(PNG)))
-            self.end_headers()
-            self.wfile.write(PNG)
+
+        body = blob[start:]
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        # 分块发送，模拟真实传输
+        CH = 128 * 1024
+        for i in range(0, len(body), CH):
+            self.wfile.write(body[i:i + CH])
+
+    def do_GET(self):
+        # 正常图片
+        if self.path.startswith("/img/"):
+            self._send_blob(PNG, ranged=True)
             return
+
+        # 第一次只发一半就断连，第二次（带 Range）正常 —— 模拟 CDN 掐断
+        if self.path.startswith("/flaky/"):
+            STATE["flaky_hits"] += 1
+            rng = self.headers.get("Range")
+            if STATE["flaky_hits"] == 1 and not rng:
+                half = len(BIG_PNG) // 2
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                # Content-Length 声明全长，但只发一半就断开 -> IncompleteRead
+                self.send_header("Content-Length", str(len(BIG_PNG)))
+                self.end_headers()
+                self.wfile.write(BIG_PNG[:half])
+                self.wfile.flush()
+                self.close_connection = True
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+                return
+            self._send_blob(BIG_PNG, ranged=True)
+            return
+
         self._json(404, {"error": {"message": "nf"}})
 
 
@@ -200,6 +257,20 @@ with tempfile.TemporaryDirectory() as td:
         env=env, timeout=60,
     )
     check("显式 --api-key 可用", r.returncode == 0, r.stderr[-300:] if r.returncode else "")
+
+    print("\n== 链路9: 下载中途掐断 → 重试续传 ==")
+    r = run(["gen", "big", "-m", "mock-flaky", "--base",
+             f"http://127.0.0.1:{PORT}/v1", "--outdir", str(td / "g")])
+    check("退出码 0（重试后成功）", r.returncode == 0,
+          r.stderr[-500:] if r.returncode else "")
+    gf = list((td / "g").glob("*.png"))
+    check("最终落地 1 张", len(gf) == 1, str(gf))
+    check("内容完整（长度匹配）",
+          gf and gf[0].read_bytes() == BIG_PNG,
+          f"got {gf[0].stat().st_size if gf else 0} want {len(BIG_PNG)}")
+    check("触发了重试", "下载失败" in r.stderr)
+    check("走的是 Range 续传", STATE["flaky_hits"] >= 2,
+          f"hits={STATE['flaky_hits']}")
 
 srv.shutdown()
 print()
