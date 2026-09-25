@@ -34,6 +34,22 @@ python scripts/xqapi_image.py models
 1k 就要 110s，4k 基本必然顶到 600s 上限 —— **长任务一律加 `--async`**。
 嫌下载慢可以试 `--b64-json`。
 
+**④ 图生图：multipart 多图会超时。** 实测 `gpt-image-2` 图生图：
+
+| 操作 | 路径 | 生成 | 下载 | 端到端 | 结果 |
+|---|---|---|---|---|---|
+| 单图编辑 | multipart | 69.2s | 81.8s | 151.0s | ✅ |
+| 单图编辑 | JSON image_url | 69.5s | 44.9s | 114.4s | ✅ |
+| 多图编辑(2张) | multipart 同步 | >600s | — | 超时 | ❌ |
+| 多图编辑(2张) | multipart + async | — | — | SSL EOF | ❌ |
+
+**结论：**
+- 单图编辑没问题，JSON 路下载更快
+- multipart 多图同步路超 600s 超时
+- multipart 多图 + async 会 SSL EOF（body 太大被断）
+- **多图编辑用 JSON 路**：`--image-url <u1> --image-url <u2> --async`
+- 带 mask 的局部重绘建议加 `--async`
+
 ## 安装
 
 无需安装，克隆即用（要求 Python 3.9+）：

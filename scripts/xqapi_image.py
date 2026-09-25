@@ -521,6 +521,20 @@ def call_image_api(
             die("异步任务申请阶段就超时了，请重试或检查站点状态")
         raise Timeout504(504, text, url)
 
+    # SSL EOF / 连接重置：实测 multipart 多图上传时会发生
+    if status == 0 and ("EOF" in text or "UNEXPECTED_EOF" in text
+                          or "ConnectionReset" in text):
+        if use_async:
+            die("异步提交阶段连接被断开。可能是上传 body 过大；"
+                "减少参考图数量或改用 JSON 路 --image-url", 3)
+        raise XqapiError(0, text, url)
+
+    # 客户端读超时（urllib TimeoutError）
+    if status == 0 and "timed out" in text.lower():
+        if use_async:
+            die("异步提交阶段读超时，请重试", 3)
+        raise Timeout504(504, text, url)
+
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
@@ -686,6 +700,16 @@ def cmd_edit(args: argparse.Namespace) -> int:
         if args.mask:
             files.append(("mask", Path(args.mask)))
         mp = _encode_multipart(fields, files)
+
+        # 实测：multipart 多图(>=2)或带 mask 的同步路容易超 600s 或 SSL EOF。
+        # 没加 --async 时给个警告。
+        heavy = len(imgs) >= 2 or bool(args.mask)
+        if heavy and not args.use_async:
+            print(
+                "[xqapi-image] 提示: 多图参考或 mask 局部重绘实测容易超 600s\n"
+                "  同步上限或触发 SSL EOF。建议加 --async 走异步任务路。",
+                file=sys.stderr,
+            )
 
         print(
             f"[xqapi-image] multipart 路，{len(imgs)} 张参考图"
@@ -867,12 +891,25 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except Timeout504 as e:
         print(
-            "\n[xqapi-image] 同步等待超过上限（504）。\n"
+            "\n[xqapi-image] 同步等待超过上限（504 / 客户端超时）。\n"
             "  建议：重跑时加 --async，或调大 --timeout / --poll-max-wait。",
             file=sys.stderr,
         )
         return 4
     except XqapiError as e:
+        # SSL EOF / 连接重置：multipart 多图上传实测会触发
+        body = e.body or ""
+        if e.status == 0 and ("EOF" in body or "ConnectionReset" in body
+                                or "UNEXPECTED_EOF" in body):
+            print(
+                "\n[xqapi-image] 连接被断开（SSL EOF / Connection Reset）。\n"
+                "  实测 multipart 多图上传容易触发。处置：\n"
+                "  1) 加 --async 走异步任务路\n"
+                "  2) 减少参考图数量\n"
+                "  3) 改用 JSON 路 --image-url <url> 传直链而非上传文件",
+                file=sys.stderr,
+            )
+            return 3
         print(f"\n[xqapi-image] API 错误: {e}", file=sys.stderr)
         return 3
     except KeyboardInterrupt:

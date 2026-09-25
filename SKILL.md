@@ -123,13 +123,36 @@ POST 提交 → 200 响应      109.6s   ← 纯生成
 两者同时给会被脚本拒绝（这是刻意的，避免歧义）。另有扩展字段
 `--image-urls <u1> <u2>` 直接给一组 URL。
 
+### 图生图实测数据（gpt-image-2）
+
+| 操作 | 路径 | 生成 | 下载 | 端到端 | 结果 |
+|---|---|---|---|---|---|
+| 单图编辑 | multipart | 69.2s | 81.8s | 151.0s | ✅ |
+| 单图编辑 | JSON image_url | 69.5s | 44.9s | 114.4s | ✅ |
+| 多图编辑(2张) | multipart 同步 | >600s | — | **超时** | ❌ TimeoutError |
+| 多图编辑(2张) | multipart + async | — | — | SSL EOF | ❌ 连接被断 |
+
+**关键结论：**
+
+1. **单图编辑没问题**，multipart 和 JSON 两路都通，JSON 路下载更快。
+2. **multipart 多图同步路会超 600s 超时**——服务端处理多图参考明显更慢。
+3. **multipart 多图 + async 会 SSL EOF**——上传 2 份图片的 body 可能被前置切断。
+4. **多图编辑推荐 JSON 路**：`--image-url <u1> --image-url <u2> --async`，
+   传直链而非上传文件，绕开 body 大小问题。
+5. 带.mask 的局部重绘走 multipart 同步路同样有超时风险，**建议加 `--async`**。
+
+脚本已在 multipart 多图或带 mask 且未加 `--async` 时打印警告。
+
 ### 长任务怎么选
 
 | 场景 | 做法 |
 |---|---|
-| 1k、普通质量 | 默认同步，通常几十秒 |
-| 4k / 高质量 / 多张 | **加 `--async`** |
-| 同步路吃到 504 | 重跑加 `--async`，或调 `--timeout` |
+| 文生图 1k | 默认同步，50~110s |
+| 文生图 4k | **加 `--async`** |
+| 图生图单图 | 同步可，JSON 路更快 |
+| 图生图多图 | **加 `--async`，用 JSON 路 `--image-url`** |
+| 图生图 + mask | **加 `--async`** |
+| 同步路吃到 504 / SSL EOF | 重跑加 `--async`，或换 JSON 路 |
 | 断线了想续 | `python scripts/xqapi_image.py task <task_id>` |
 
 ## 参数速查
@@ -202,9 +225,11 @@ examples/*.md              提示词与用法示例
 |---|---|---|
 | **403 / Error 1010** | **UA 缺失或不被接受** | 去掉 `--user-agent` 用默认，或给一个像样的 UA |
 | `模型不存在或未启用` (400) | 模型名照抄了文档占位符 | 先跑 `models` 子命令查真名 |
-| 退出码 4 | 同步超 600s，站点 504 | 加 `--async` |
+| 退出码 4 | 同步超 600s，站点 504 或客户端超时 | 加 `--async` |
+| 退出码 3 + SSL EOF | multipart 多图上传 body 被断 | 加 `--async`，或改 JSON 路 `--image-url` |
 | 退出码 3 | API 报错 | 看 stderr 里的响应体 |
 | `quality` 传了报 400 | 该模型不支持这个取值 | 去掉，或 `probe` 摸一遍 |
 | 参考图 > 16 | 站点硬限制 | 拆成多次调用 |
+| 多图编辑超时 | multipart 多图同步路实测 >600s | JSON 路 `--image-url` + `--async` |
 | 出图快、等下载慢 | 直链下载带宽受限（实测 2.5MB 走 70s） | 试 `--b64-json` |
 | 中文乱码 | 控制台码页非 UTF-8 | 设 `PYTHONIOENCODING=utf-8` |
