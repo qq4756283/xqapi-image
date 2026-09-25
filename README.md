@@ -50,6 +50,17 @@ python scripts/xqapi_image.py models
 - **多图编辑用 JSON 路**：`--image-url <u1> --image-url <u2> --async`
 - 带 mask 的局部重绘建议加 `--async`
 
+**⑤ 异步任务端点和形状与文档示例不符。** 实测 `gpt-image-2` async 任务：
+
+| 项 | 文档示例 | **实测** |
+|---|---|---|
+| 查询端点 | `GET /v1/tasks/:id` | ✅ 一致 |
+| 成功状态 | `succeeded` | ❌ **`completed`** |
+| 结果字段 | — | `results: ["url"]` URL 字符串数组 |
+| 错误字段 | — | `error: null` 或 `{code, message, type}` |
+
+脚本已对齐实测：用 `GET /v1/tasks/{id}` 查询，终态认 `completed`，`results[]` 归一化成 `data[]` 下载，`failed` 时读 `error` 字段给诊断。
+
 ## 安装
 
 无需安装，克隆即用（要求 Python 3.9+）：

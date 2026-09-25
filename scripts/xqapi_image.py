@@ -373,6 +373,7 @@ def save_results(
 
 
 def _extract_task_id(payload: dict) -> str | None:
+    """从响应里取任务 ID。实测字段名是 id（不是 task_id）。"""
     for k in ("task_id", "id", "taskId"):
         v = payload.get(k)
         if isinstance(v, str) and v:
@@ -387,14 +388,52 @@ def _extract_task_id(payload: dict) -> str | None:
 
 
 def _looks_like_task(payload: dict) -> bool:
-    """async 响应识别：有 task_id 且无 data[] 或 data 非图片列表。"""
+    """
+    async 响应识别。实测形状：
+      {id, object:"image.generation.task", status:"pending"|"processing"|
+       "completed"|"failed", results:[], usage:{}, error:null}
+    和同步直出的区别：有 id + object 字段 + status 是任务态 + 无 data[] 图片列表。
+    """
+    # 实测 async 响应带 object:"image.generation.task"
+    obj = str(payload.get("object") or "").lower()
+    if "task" in obj:
+        return True
+    # 兜底：有 task_id/id 且无 data[] 或 data 非图片列表
     if _extract_task_id(payload) is None:
         return False
     data = payload.get("data")
     if isinstance(data, list) and data and isinstance(data[0], dict):
         if "url" in data[0] or "b64_json" in data[0]:
             return False
+    # 有 results[] 字段（即使为空）也算任务
+    if "results" in payload:
+        return True
     return True
+
+
+def _normalize_task_results(payload: dict) -> dict:
+    """
+    把任务响应归一化成 save_results 认的形状：{data: [{"url":...}]}。
+
+    实测 async 任务完成时返回：
+      results: ["https://...png"]   ← URL 字符串数组
+    而同步直出返回：
+      data: [{"url": "https://..."}]  ← 对象数组
+
+    这里把 results 转成 data[] 对象数组，让下游统一处理。
+    同时把 error 字段（如果有）转成顶层 error，方便诊断。
+    """
+    if "results" in payload and "data" not in payload:
+        results = payload.get("results") or []
+        items = []
+        for r in results:
+            if isinstance(r, str) and r:
+                items.append({"url": r})
+            elif isinstance(r, dict):
+                items.append(r)
+        payload = dict(payload)
+        payload["data"] = items
+    return payload
 
 
 def poll_task(
@@ -407,7 +446,14 @@ def poll_task(
     quiet: bool = False,
     ua: str | None = None,
 ) -> dict:
-    """轮询异步任务直到出图 / 失败 / 超时。"""
+    """
+    轮询异步任务直到完成 / 失败 / 超时。
+
+    实测端点：GET /v1/tasks/{id}（不是 /images/tasks/）
+    实测状态：pending -> processing -> completed | failed
+    实测结果：results: ["url"] 字符串数组（归一化成 data[]）
+    实测错误：error: null 或 {message, code, type}
+    """
     deadline = time.monotonic() + max_wait
     attempt = 0
 
@@ -416,48 +462,54 @@ def poll_task(
         if time.monotonic() > deadline:
             die(f"异步任务 {task_id} 轮询超过 {max_wait}s 仍未完成")
 
-        url = f"{base}/images/tasks/{task_id}"
+        # 实测正确端点
+        url = f"{base}/tasks/{task_id}"
         t0 = time.monotonic()
-        status, body = _request(url, api_key, json_body=None, timeout=60.0, ua=ua)
+        status, body = _get(url, api_key, timeout=60.0, ua=ua)
         elapsed = time.monotonic() - t0
-
-        # GET 语义：这里用 POST 空体查任务，若站点要 GET 会 405，
-        # 回退到 GET 形式。
-        if status in (404, 405):
-            status, body = _get(url, api_key, timeout=60.0, ua=ua)
 
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
             die(f"任务查询返回非 JSON (HTTP {status}): {body[:300]}")
 
-        if status >= 400 and status not in (404, 405):
+        if status >= 400:
             raise XqapiError(status, body, url)
 
         state = str(
             payload.get("status")
             or payload.get("state")
-            or (payload.get("data") or {}).get("status")
             or ""
         ).lower()
 
         if not quiet:
+            results_n = len(payload.get("results") or [])
             print(
                 f"  [poll #{attempt}] status={state or '?'} "
-                f"({elapsed:.1f}s) task={task_id}",
+                f"results={results_n} ({elapsed:.1f}s)",
                 file=sys.stderr,
             )
 
-        if state in ("succeeded", "success", "completed", "done", "finished"):
-            return payload
-        if state in ("failed", "error", "canceled", "cancelled"):
-            die(f"异步任务失败: {json.dumps(payload, ensure_ascii=False)[:500]}")
+        # 实测终态：completed（不是 succeeded）
+        if state in ("completed", "succeeded", "success", "done", "finished"):
+            return _normalize_task_results(payload)
 
-        # 有些实现直接在轮询响应里返回 data[]
-        data = payload.get("data")
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            if "url" in data[0] or "b64_json" in data[0]:
-                return payload
+        # 失败时读 error 字段，给安全错误信息
+        if state in ("failed", "error", "canceled", "cancelled"):
+            err = payload.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or err.get("type") or str(err)
+                code = err.get("code", "")
+                die(
+                    f"异步任务失败 [{code}]: {msg}\n"
+                    f"  完整错误: {json.dumps(payload, ensure_ascii=False)[:500]}",
+                    3,
+                )
+            elif isinstance(err, str) and err:
+                die(f"异步任务失败: {err}", 3)
+            else:
+                die(f"异步任务失败: {json.dumps(payload, ensure_ascii=False)[:500]}",
+                    3)
 
         time.sleep(interval)
 

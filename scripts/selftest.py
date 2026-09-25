@@ -61,15 +61,35 @@ with tempfile.TemporaryDirectory() as td:
     check("写出 1 个文件", len(got) == 1, str(got))
     check("内容字节一致", out.read_bytes() == raw)
 
-print("== 任务识别 ==")
-check("task_id 形状识别", x._looks_like_task({"task_id": "abc", "status": "pending"}))
+print("== 任务识别（实测形状：object + id + results[]）==")
+# 实测 async 响应形状
+check("object 含 task -> 识别",
+      x._looks_like_task({"id": "abc", "object": "image.generation.task",
+                          "status": "pending", "results": []}))
 check("id 形状识别", x._looks_like_task({"id": "abc", "status": "queued"}))
+check("task_id 形状识别", x._looks_like_task({"task_id": "abc", "status": "pending"}))
+check("有 results[] -> 识别", x._looks_like_task({"id": "x", "results": []}))
 check("直出 url 不算任务",
       not x._looks_like_task({"data": [{"url": "https://x/y.png"}]}))
 check("直出 b64 不算任务",
       not x._looks_like_task({"data": [{"b64_json": "AAA"}]}))
 check("data 形状取 task_id", x._extract_task_id({"data": {"task_id": "t9"}}) == "t9")
-check("顶层取 task_id", x._extract_task_id({"task_id": "t1"}) == "t1")
+check("顶层取 id", x._extract_task_id({"id": "t1"}) == "t1")
+check("顶层取 task_id", x._extract_task_id({"task_id": "t2"}) == "t2")
+
+print("== results 归一化 ==")
+# 实测：results 是 URL 字符串数组，要转成 data[] 对象数组
+p = x._normalize_task_results({
+    "id": "t", "status": "completed",
+    "results": ["https://x/a.png", "https://x/b.png"],
+})
+check("results 转 data[] 长度 2", len(p["data"]) == 2)
+check("data[0] 是对象", isinstance(p["data"][0], dict))
+check("data[0].url", p["data"][0]["url"] == "https://x/a.png")
+p2 = x._normalize_task_results({"results": ["https://x/c.png"]})
+check("单个 URL 也转", p2["data"][0]["url"] == "https://x/c.png")
+p3 = x._normalize_task_results({"data": [{"url": "x"}]})
+check("已有 data[] 不动", p3["data"] == [{"url": "x"}])
 
 print("== 参数透传 ==")
 body = {"model": "m"}

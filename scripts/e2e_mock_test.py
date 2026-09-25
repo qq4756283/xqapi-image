@@ -62,27 +62,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if body.get("async") is True:
                 STATE["polls"] = 0
-                self._json(200, {"task_id": "task-123", "status": "pending"})
+                STATE["failed_once"] = False
+                # 实测形状：object + id + status + results[] + error
+                self._json(200, {
+                    "id": "task-123",
+                    "object": "image.generation.task",
+                    "model": body.get("model", "mock"),
+                    "status": "pending",
+                    "results": [],
+                    "usage": {},
+                    "error": None,
+                })
                 return
             self._json(200, {
                 "created": 1,
                 "data": [{"url": f"http://127.0.0.1:{PORT}/img/0.png"}],
                 "usage": {"total_tokens": 5},
             })
-            return
-
-        # ---- 模式 B: 异步任务查询 ----
-        if "/images/tasks/" in self.path:
-            STATE["polls"] += 1
-            if STATE["polls"] < 3:
-                self._json(200, {"status": "processing", "task_id": "task-123"})
-            else:
-                self._json(200, {
-                    "status": "succeeded",
-                    "task_id": "task-123",
-                    "data": [{"url": f"http://127.0.0.1:{PORT}/img/0.png"}],
-                    "usage": {"total_tokens": 7},
-                })
             return
 
         # ---- 模式 C: 图生图 multipart ----
@@ -153,6 +149,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send_blob(BIG_PNG, ranged=True)
             return
 
+        # ---- 异步任务查询（实测端点 GET /v1/tasks/{id}） ----
+        if self.path.startswith("/v1/tasks/task-fail"):
+            STATE["failed_once"] = True
+            self._json(200, {
+                "id": "task-fail", "object": "image.generation.task",
+                "status": "failed", "results": [],
+                "error": {"code": "CONTENT_POLICY",
+                          "message": "prompt violates content policy",
+                          "type": "content_filter"},
+                "usage": {},
+            })
+            return
+
+        if self.path.startswith("/v1/tasks/"):
+            STATE["polls"] += 1
+            if STATE["polls"] < 3:
+                self._json(200, {
+                    "id": "task-123", "object": "image.generation.task",
+                    "status": "processing", "results": [],
+                    "usage": {"total_tokens": 7}, "error": None,
+                })
+            else:
+                self._json(200, {
+                    "id": "task-123", "object": "image.generation.task",
+                    "status": "completed",
+                    "results": [f"http://127.0.0.1:{PORT}/img/0.png"],
+                    "usage": {"total_tokens": 7}, "error": None,
+                })
+            return
+
         self._json(404, {"error": {"message": "nf"}})
 
 
@@ -197,7 +223,7 @@ with tempfile.TemporaryDirectory() as td:
     check("内容与源一致", files and files[0].read_bytes() == PNG)
     check("打印 usage", "total_tokens" in r.stdout)
 
-    print("\n== 链路2: async 任务轮询 ==")
+    print("\n== 链路2: async 任务轮询（实测形状 results[] URL 数组）==")
     r = run(["gen", "a dog", "-m", "mock", "--async",
              "--poll-interval", "0.2", "--base", f"http://127.0.0.1:{PORT}/v1",
              "--outdir", str(td / "b")])
@@ -205,6 +231,7 @@ with tempfile.TemporaryDirectory() as td:
     check("发生了 3 次轮询", STATE["polls"] == 3, f"polls={STATE['polls']}")
     check("轮询日志出现", "poll #" in r.stderr)
     check("任务完成后落地", len(list((td / "b").glob("*.png"))) == 1)
+    check("results URL 数组被正确转成 data[] 下载", len(list((td / "b").glob("*.png"))) == 1)
 
     print("\n== 链路3: 504 超时软着陆 ==")
     r = run(["gen", "x", "-m", "mock-slow",
@@ -271,6 +298,14 @@ with tempfile.TemporaryDirectory() as td:
     check("触发了重试", "下载失败" in r.stderr)
     check("走的是 Range 续传", STATE["flaky_hits"] >= 2,
           f"hits={STATE['flaky_hits']}")
+
+    print("\n== 链路10: 失败任务 -> error 字段解析 ==")
+    # task 子命令查一个失败任务，验证 error 字段被正确解析
+    r = run(["task", "task-fail", "--poll-interval", "0.2", "--poll-max-wait", "10",
+             "--base", f"http://127.0.0.1:{PORT}/v1"])
+    check("退出码 3（失败）", r.returncode == 3, f"rc={r.returncode}")
+    check("打印了 error code", "CONTENT_POLICY" in r.stderr or "CONTENT_POLICY" in r.stdout)
+    check("打印了 error message", "content policy" in r.stderr.lower() or "content policy" in r.stdout.lower())
 
 srv.shutdown()
 print()

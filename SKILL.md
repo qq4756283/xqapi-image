@@ -155,6 +155,42 @@ POST 提交 → 200 响应      109.6s   ← 纯生成
 | 同步路吃到 504 / SSL EOF | 重跑加 `--async`，或换 JSON 路 |
 | 断线了想续 | `python scripts/xqapi_image.py task <task_id>` |
 
+### 异步任务实测形状（文档没写，实测出来的）
+
+提交 async 请求后，响应形状（不是同步的 `data[]`）：
+
+```json
+{
+  "id": "71954476-...",
+  "object": "image.generation.task",
+  "model": "gpt-image-2",
+  "status": "pending",
+  "results": [],
+  "usage": {},
+  "error": null
+}
+```
+
+查询端点：**`GET /v1/tasks/{id}`**（不是 `/images/tasks/`，实测后者 404）
+
+状态流转：`pending` → `processing` → **`completed`** | `failed`
+
+**注意：终态是 `completed`，不是文档示例里的 `succeeded`。**
+
+完成时 `results` 是 **URL 字符串数组**（不是 `data[]` 对象数组）：
+```json
+{"status": "completed", "results": ["https://xqapi.com/uploads/.../xxx.png"]}
+```
+
+脚本内部已做归一化：`results[]` → `data[]` 对象数组，下游 `save_results` 统一处理。
+
+失败时 `error` 字段有安全错误信息：
+```json
+{"status": "failed", "error": {"code": "CONTENT_POLICY", "message": "...", "type": "..."}}
+```
+
+脚本会读 `error.message` 和 `error.code` 打印诊断，退出码 3。
+
 ## 参数速查
 
 通用（`gen` / `edit` 都有）：
